@@ -12,7 +12,7 @@ import tantivy
 from dateutil.relativedelta import relativedelta
 from django.conf import settings
 
-from documents.search._normalize import ascii_fold
+from documents.search._tokenizer import _simple_search_analyzer
 
 if TYPE_CHECKING:
     from datetime import tzinfo
@@ -53,7 +53,6 @@ _WHOOSH_REL_RANGE_RE = regex.compile(
 )
 # Whoosh-style 8-digit date: field:YYYYMMDD — field-aware so timezone can be applied correctly
 _DATE8_RE = regex.compile(r"(?P<field>\w+):(?P<date8>\d{8})\b")
-_SIMPLE_QUERY_TOKEN_RE = regex.compile(r"\S+")
 
 
 def _fmt(dt: datetime) -> str:
@@ -538,13 +537,21 @@ def parse_simple_query(
     """
     Parse a plain-text query using Tantivy over a restricted field set.
 
-    Query string is escaped and normalized to be treated as "simple" text query.
+    Runs the raw query through the same ``_simple_search_analyzer``
+    instance the index side uses, so query-time tokenization matches
+    index-time tokenization exactly for every script. Builds a regex
+    substring query per field on the resulting tokens.
+
+    A fresh analyzer is constructed per call because Tantivy's
+    ``TextAnalyzer`` holds mutable per-instance state (internal token
+    buffer) and is not safe to share across threads under gunicorn's
+    threaded worker model.
     """
-    tokens = [
-        ascii_fold(token.lower())
-        for token in _SIMPLE_QUERY_TOKEN_RE.findall(raw_query, timeout=_REGEX_TIMEOUT)
-    ]
-    tokens = [token for token in tokens if token]
+    analyzer = _simple_search_analyzer()
+    raw_tokens = analyzer.analyze(raw_query)
+    # Fallback for tantivy-py versions that return Token objects rather
+    # than plain strings — unwrap .text if present, otherwise pass through.
+    tokens = [t if isinstance(t, str) else t.text for t in raw_tokens]
     if not tokens:
         return tantivy.Query.empty_query()
 

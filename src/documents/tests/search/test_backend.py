@@ -428,6 +428,114 @@ class TestSearch:
             == 0
         )
 
+    def test_text_mode_matches_cyrillic_content(
+        self,
+        backend: TantivyBackend,
+    ):
+        """Simple text mode must find Cyrillic content with Cyrillic queries."""
+        doc = Document.objects.create(
+            title="Документ Водоканала",
+            content="Водоканал выставил счёт за воду. ИНН 5078018370.",
+            checksum="CYR1",
+            pk=101,
+        )
+        backend.add_or_update(doc)
+
+        results = backend.search(
+            "водоканал",
+            user=None,
+            page=1,
+            page_size=10,
+            sort_field=None,
+            sort_reverse=False,
+            search_mode=SearchMode.TEXT,
+        )
+        assert results.total == 1
+        assert doc.id in {hit["id"] for hit in results.hits}
+
+    def test_text_mode_matches_cyrillic_substring_within_token(
+        self,
+        backend: TantivyBackend,
+    ):
+        """Simple text mode must find Cyrillic substrings inside indexed tokens."""
+        doc = Document.objects.create(
+            title="Счёт за воду",
+            content="Водоканал выставил счёт за воду.",
+            checksum="CYR2",
+            pk=102,
+        )
+        backend.add_or_update(doc)
+
+        # 'вод' is a prefix of the indexed token 'водоканал'.
+        results = backend.search(
+            "вод",
+            user=None,
+            page=1,
+            page_size=10,
+            sort_field=None,
+            sort_reverse=False,
+            search_mode=SearchMode.TEXT,
+        )
+        assert results.total == 1
+        assert doc.id in {hit["id"] for hit in results.hits}
+
+    def test_text_mode_matches_cyrillic_case_insensitive(
+        self,
+        backend: TantivyBackend,
+    ):
+        """Simple text mode must lowercase-fold Cyrillic queries at analyze time."""
+        doc = Document.objects.create(
+            title="Счёт за воду",
+            content="водоканал выставил счёт.",
+            checksum="CYR3",
+            pk=103,
+        )
+        backend.add_or_update(doc)
+
+        # Query is ALL CAPS, content is lowercase.
+        results = backend.search(
+            "ВОДОКАНАЛ",
+            user=None,
+            page=1,
+            page_size=10,
+            sort_field=None,
+            sort_reverse=False,
+            search_mode=SearchMode.TEXT,
+        )
+        assert results.total == 1
+        assert doc.id in {hit["id"] for hit in results.hits}
+
+    def test_title_mode_matches_cyrillic_content(
+        self,
+        backend: TantivyBackend,
+    ):
+        """Simple title mode must find Cyrillic text in the title field.
+
+        This exercises `parse_simple_title_query`, which goes through the
+        same `parse_simple_query` entry point as `parse_simple_text_query`
+        but with the restricted `[simple_title]` field set — confirming the
+        analyzer-based fix covers the `?title_search=` route as well.
+        """
+        doc = Document.objects.create(
+            title="Договор с Водоканалом",
+            content="monthly statement",
+            checksum="CYR4",
+            pk=104,
+        )
+        backend.add_or_update(doc)
+
+        results = backend.search(
+            "водоканалом",
+            user=None,
+            page=1,
+            page_size=10,
+            sort_field=None,
+            sort_reverse=False,
+            search_mode=SearchMode.TITLE,
+        )
+        assert results.total == 1
+        assert doc.id in {hit["id"] for hit in results.hits}
+
 
 class TestRebuild:
     """Test index rebuilding functionality."""
