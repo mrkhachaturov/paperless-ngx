@@ -17,7 +17,6 @@ import regex
 import tantivy
 from django.conf import settings
 from django.utils.timezone import get_current_timezone
-from guardian.shortcuts import get_users_with_perms
 
 from documents.search._normalize import ascii_fold
 from documents.search._query import build_permission_filter
@@ -372,6 +371,14 @@ class TantivyBackend:
             doc.add_unsigned("owner_id", document.owner_id)
 
         # Viewers with permission
+        # Lazy import: at module load time, importing guardian.shortcuts
+        # would transitively import django.contrib.auth.models, which fails
+        # when this file is reached during Django settings load (via
+        # `from documents.search._tokenizer import SUPPORTED_LANGUAGES`
+        # in paperless/settings/__init__.py). Deferring to function scope
+        # breaks the cycle.
+        from guardian.shortcuts import get_users_with_perms
+
         users_with_perms = get_users_with_perms(
             document,
             only_with_perms_in=["view_document"],
