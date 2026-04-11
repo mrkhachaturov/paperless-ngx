@@ -310,17 +310,22 @@ def test_query_similar_documents(
         mock_retriever_cls.return_value = mock_retriever
 
         mock_node1 = MagicMock()
-        mock_node1.metadata = {"document_id": 1}
+        mock_node1.metadata = {"document_id": "1"}
 
         mock_node2 = MagicMock()
-        mock_node2.metadata = {"document_id": 2}
+        mock_node2.metadata = {"document_id": "2"}
 
+        # Widening loop: first pass returns both distinct docs. With
+        # top_k=2 this is enough to stop after one pass. (The new
+        # implementation normalizes document_id metadata to str and
+        # uses an iterative widening loop with document-level dedupe.)
         mock_retriever.retrieve.return_value = [mock_node1, mock_node2]
 
-        mock_filtered_docs = [MagicMock(pk=1), MagicMock(pk=2)]
-        mock_filter.return_value = mock_filtered_docs
+        mock_doc1 = MagicMock(pk=1)
+        mock_doc2 = MagicMock(pk=2)
+        mock_filter.return_value = [mock_doc1, mock_doc2]
 
-        result = indexing.query_similar_documents(real_document, top_k=3)
+        result = indexing.query_similar_documents(real_document, top_k=2)
 
         mock_load_or_build_index.assert_called_once()
         mock_retriever_cls.assert_called_once()
@@ -329,7 +334,7 @@ def test_query_similar_documents(
         )
         mock_filter.assert_called_once_with(pk__in=[1, 2])
 
-        assert result == mock_filtered_docs
+        assert {d.pk for d in result} == {1, 2}
 
 
 @pytest.mark.django_db

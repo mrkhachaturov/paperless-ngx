@@ -309,8 +309,30 @@ def query_similar_documents(
     document_ids: list[int] | None = None,
 ) -> list[Document]:
     """
-    Runs a similarity query and returns top-k similar Document objects.
+    Return documents similar to ``document``, optionally restricted to
+    ``document_ids`` for per-user permission scoping.
+
+    Uses an iterative widening loop with document-level dedupe to
+    handle two problems at once:
+
+    1. The vendored FAISS integration does not honour ``doc_ids``
+       filtering at query time, so we retrieve broadly and filter in
+       Python.
+    2. ``SimpleNodeParser`` fans one document into multiple chunks;
+       without document-level dedupe we can consume the entire limit
+       on repeated chunks from one document and return fewer than
+       ``top_k`` distinct documents.
+
+    The loop widens ``similarity_top_k`` exponentially when the first
+    pass does not produce enough distinct allowed documents, stops
+    early if widening produces no new raw nodes (stale-FAISS-safe
+    exhaustion detector), and hard-stops at ``RAW_MAX_TOP_K``.
+
+    An empty ``document_ids`` parameter (``[]``) is treated as "no
+    filter requested", matching the historical upstream contract.
     """
+    allowed_ids: set[str] = {str(x) for x in document_ids or []}
+
     if not vector_store_file_exists():
         queue_llm_index_update_if_needed(
             rebuild=False,
@@ -318,36 +340,82 @@ def query_similar_documents(
         )
         return []
 
-    index = load_or_build_index()
-
-    # constrain only the node(s) that match the document IDs, if given
-    doc_node_ids = (
-        [
-            node.node_id
-            for node in index.docstore.docs.values()
-            if node.metadata.get("document_id") in document_ids
-        ]
-        if document_ids
-        else None
-    )
+    try:
+        index = load_or_build_index()
+    except ValueError as exc:
+        logger.warning(
+            "query_similar_documents: failed to load LLM index: %s",
+            exc,
+        )
+        return []
 
     from llama_index.core.retrievers import VectorIndexRetriever
-
-    retriever = VectorIndexRetriever(
-        index=index,
-        similarity_top_k=top_k,
-        doc_ids=doc_node_ids,
-    )
 
     query_text = truncate_content(
         (document.title or "") + "\n" + (document.content or ""),
     )
-    results = retriever.retrieve(query_text)
 
-    document_ids = [
-        int(node.metadata["document_id"])
-        for node in results
-        if "document_id" in node.metadata
-    ]
+    # Iterative widening loop with document-level dedupe. Stops after
+    # `top_k` distinct allowed documents are collected, exhaustion is
+    # detected by observing a raw-node count plateau, or the hard cap
+    # at RAW_MAX_TOP_K is reached.
+    RAW_INITIAL_TOP_K = max(top_k * 20, 100)
+    RAW_WIDEN_FACTOR = 4
+    RAW_MAX_TOP_K = max(top_k * 100, 1000)
 
-    return list(Document.objects.filter(pk__in=document_ids))
+    raw_top_k = RAW_INITIAL_TOP_K
+    seen_document_ids: list[str] = []
+    prev_raw_count = -1
+
+    while True:
+        retriever = VectorIndexRetriever(
+            index=index,
+            similarity_top_k=raw_top_k,
+        )
+        try:
+            nodes_raw = retriever.retrieve(query_text)
+        except Exception:
+            logger.exception(
+                "query_similar_documents: retriever raised at top_k=%s",
+                raw_top_k,
+            )
+            # Keep whatever seen_document_ids the previous (successful)
+            # pass produced. Partial result is better than none.
+            break
+
+        # Successful retrieve — recompute dedupe from scratch on the
+        # new (larger) raw set. We overwrite, not append, because the
+        # larger raw set may shift ranking.
+        candidate_ids: list[str] = []
+        for node in nodes_raw:
+            doc_id = node.metadata.get("document_id")
+            if doc_id is None:
+                continue
+            if allowed_ids and doc_id not in allowed_ids:
+                continue
+            if doc_id in candidate_ids:
+                continue
+            candidate_ids.append(doc_id)
+            if len(candidate_ids) >= top_k:
+                break
+
+        seen_document_ids = candidate_ids
+
+        if len(seen_document_ids) >= top_k:
+            break
+
+        if len(nodes_raw) == prev_raw_count:
+            break
+        prev_raw_count = len(nodes_raw)
+
+        if raw_top_k >= RAW_MAX_TOP_K:
+            break
+        raw_top_k = min(raw_top_k * RAW_WIDEN_FACTOR, RAW_MAX_TOP_K)
+
+    # Final ORM fetch. Preserve rank order explicitly — pk__in returns
+    # in whatever order Django wants.
+    int_ids = [int(x) for x in seen_document_ids]
+    documents_by_id = {
+        d.pk: d for d in Document.objects.filter(pk__in=int_ids)
+    }
+    return [documents_by_id[pk] for pk in int_ids if pk in documents_by_id]
